@@ -73,7 +73,11 @@ public class Main {
         channelDataToConvert.add(getDataPortion(4, ConverterInterface.Channel.RIGHT_CHANNEL));
 
         channelDataToConvert.forEach(conversionManagement::addDataPortion);
+        conversionManagement.setCores(3);
+
+
         conversionManagement.setCores(1);
+
     }
 }
 
@@ -305,10 +309,13 @@ class ConversionResultTemp implements Comparable {
  * Klasa glowna
  */
 class ConversionManagement implements ConversionManagementInterface {
-    private final Object lockHelper = new Object();
+    private final Object dataLockHelper = new Object();
+    private final Object threadLockHelper = new Object();
     private final Comparator<ConverterInterface.DataPortionInterface> comparatorForData = (p1, p2) -> Integer.compare(p1.id(), p2.id());
 
     private AtomicInteger actualIdReceive; //wzorzec Command/Polecenie (?)
+    private AtomicInteger actualThreadCount; //wzorzec Command/Polecenie (?)
+    private AtomicInteger coresCount; //wzorzec Command/Polecenie (?)
     private PriorityBlockingQueue<ConverterInterface.DataPortionInterface> channelDataToConvert;
     private PriorityBlockingQueue<ConversionResultTemp> dataToReceiveList; //Lista danych uzupelniana podczas pracy programu i jezeli wszystkie dane sa skompletowane to rekord zostaje zwrocony i usuniety z listy
 
@@ -326,7 +333,7 @@ class ConversionManagement implements ConversionManagementInterface {
         return data;
     }
 
-    private void addDataToReceive(ConverterInterface.DataPortionInterface data, long value) {
+    private synchronized void addDataToReceive(ConverterInterface.DataPortionInterface data, long value) {
         ConversionResultTemp conversionResultDataTemp = dataToReceiveList.stream()
                 .filter(conversionResultTemp -> conversionResultTemp.isPresentedData(data))
                 .findFirst()
@@ -359,6 +366,8 @@ class ConversionManagement implements ConversionManagementInterface {
 
     public ConversionManagement() {
         this.actualIdReceive = new AtomicInteger(1);
+        this.actualThreadCount = new AtomicInteger(0);
+        this.coresCount = new AtomicInteger(0);
         channelDataToConvert = new PriorityBlockingQueue<>(100, comparatorForData);
         dataToReceiveList = new PriorityBlockingQueue<>();
         threads = new PriorityBlockingQueue<>();
@@ -366,14 +375,6 @@ class ConversionManagement implements ConversionManagementInterface {
     }
 
     //region pomocnicze metody
-
-    private void doConvertInThread() {
-        ConverterInterface.DataPortionInterface data = getNextDataToConvert();
-        if (data != null) {
-            long value = converter.convert(data);
-            addDataToReceive(data, value);
-        }
-    }
 
     private synchronized void sendResultToReceiverAndRemoveTemp(ConversionResultTemp tempData) {
         //czy kolej na nastepny result
@@ -403,9 +404,19 @@ class ConversionManagement implements ConversionManagementInterface {
         ConversionResult finalConversionResult = new ConversionResult(tempData.getLeftChannelData(), tempData.getRightChannelData(),
                 tempData.getLeftChannelConversionResult(), tempData.getRightChannelConversionResult());
 
-        //TODO Wyniki obliczeń należy przekazywać użytkownikowi zawsze sekwencyjnie (tylko jeden w danej chwili)
         //synchronized ?
         receiver.result(finalConversionResult);
+    }
+
+    /**
+     * Glowna metoda odpowiedzialna za konwersje i dalej zbierajaca wyniki
+     */
+    private void doConvertInThread() {
+        ConverterInterface.DataPortionInterface data = getNextDataToConvert();
+        if (data != null) {
+            long value = converter.convert(data);
+            addDataToReceive(data, value);
+        }
     }
 
     //endregion
@@ -414,61 +425,46 @@ class ConversionManagement implements ConversionManagementInterface {
     //nie może blokować wątku, który ją wywołuje na zbyt długi okres czasu.
     @Override
     public void setCores(int cores) {
-        //TODO jeden glowny THREAD do obslugi pozostalych
         //startuje ile można
-        for (int i = 0; i < cores; i++) {
-            new Thread("Watek " + i) {
-                @Override
-                public void run() {
-                    //Program nie może zajmować zasobów CPU w przypadku, gdy system nie wykonuje żadnych operacji (nie ma danych do prowadzenia obliczeń). Oczekuje się, że utworzone przez system wątki (o ile takie będą) zostaną wstrzymane za pomocą metody wait() lub jej odpowiednika.
-                    while (true) {
-                        try {
-                            if (channelDataToConvert.isEmpty()) {
-                                synchronized (lockHelper) {
-                                    lockHelper.wait();
+        //synchronized (threadLockHelper) {
+        int changeCoefficient = cores - this.actualThreadCount.get(); //wspolczynnik zmiany
+        this.coresCount.set(cores);
+        //jesli wiekszy niz 0 dodajemy nowe watki
+        if (changeCoefficient > 0) {
+            for (int i = 0; i < changeCoefficient; i++) {
+                actualThreadCount.incrementAndGet();
+                new Thread("Watek " + i) {
+                    @Override
+                    public void run() {
+                        while (true) {
+                            try {
+                                //jesli nie ma danych do przetwarzania = to czekaj
+                                //synchronized (threadLockHelper) {
+                                if (actualThreadCount.get() > coresCount.get()) {
+                                    actualThreadCount.decrementAndGet();
+                                    return; // wystarczy return?
                                 }
+                                //}
+                                if (channelDataToConvert.isEmpty()) {
+                                    synchronized (dataLockHelper) {
+                                        dataLockHelper.wait();
+                                        //TUTAJ stopowac watki
+                                    }
+                                }
+                                //channelDataToConvert.notify();
+                                System.out.println("WATEK: " + getName() + " ***robi robote");
+                                doConvertInThread();
+                                System.out.println("WATEK: " + getName() + " ---SKONCZYL robote");
+                            } catch (InterruptedException e) {
+                                System.out.println("InterruptedException dla: " + getName() + " BLAD: " + e.getMessage());
                             }
-                            //channelDataToConvert.notify();
-                            System.out.println("WATEK: " + getName() + " ***robi robote");
-                            doConvertInThread();
-                            System.out.println("WATEK: " + getName() + " ---SKONCZYL robote");
-                        } catch (InterruptedException e) {
-                            System.out.println("InterruptedException dla: " + getName() + " BLAD: " + e.getMessage());
                         }
                     }
-
-                    //jesli nie ma danych do przetwarzania = to czekaj
-                    /*if (channelDataToConvert.size() == 0) {
-                        synchronized (this) {
-                            try {
-                                wait();
-                            } catch (InterruptedException e) {
-                                System.out.println("ERROR w wait WATEK: " + getName() + " msg: " + e.getMessage());
-                            }
-                        }
-
-
-                        //TODO metoda zrob konwersje najnizszego
-                        doConvertInThread();
-                    }*/
-
-
-                }
-            }.start();
-
-            //threads.add(thread);
+                }.start();
+            }
         }
-
-        //threads.forEach(Thread::start);
-
-
-        /*int sizeRazy = channelDataToConvert.size();
-
-        //TODO w watkach
-        for (int i = 0; i < sizeRazy; i++) {
-            doConvertInThread();
-        }*/
-
+        //}
+        //System.out.println("ILOSC WATKOW = " + this.actualThreadCount.get());
     }
 
     @Override
@@ -487,9 +483,9 @@ class ConversionManagement implements ConversionManagementInterface {
     @Override
     public void addDataPortion(ConverterInterface.DataPortionInterface data) {
         //czy tu trzeba synchronized
-        synchronized (lockHelper) {
+        synchronized (dataLockHelper) {
             this.channelDataToConvert.add(data);
-            lockHelper.notifyAll();
+            dataLockHelper.notify();
         }
 
     }
